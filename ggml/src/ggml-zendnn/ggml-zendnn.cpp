@@ -212,7 +212,8 @@ static void ggml_zendnn_compute_forward_mul_mat(
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             const void* wdata = (src1->type == vec_dot_type || src0->type == GGML_TYPE_Q8_0) ? src1->data : work_data;
-            const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+            // Q8_0 keeps src1 as F32 (dynamic quantization), so rows are F32-sized here
+            const size_t row_size = src0->type == GGML_TYPE_Q8_0 ? ne10 * sizeof(float) : ggml_row_size(vec_dot_type, ne10);
             if (!ggml_zendnn_gemm(ctx,
                                   ne01,     // m
                                   ne11,     // n
@@ -393,7 +394,7 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     // For Q8_0, src1 is always F32; the gather buffer must hold F32 rows (ne10*4 bytes),
-    // not Q8_0-encoded rows (row_size ≈ ne10/32*34 bytes) — they differ by ~4x.
+    // not Q8_0-encoded rows (row_size is about ne10/32*34 bytes); they differ by ~4x.
     const size_t f32_row_size = (size_t)ne10 * sizeof(float);
     const size_t gather_row_size = (src0->type == GGML_TYPE_Q8_0) ? f32_row_size : row_size;
 
@@ -518,6 +519,137 @@ static void ggml_zendnn_compute_forward_mul_mat_id(
     }
 }
 
+/**
+ * ZenDNN CONCAT, element-wise path: used for types whose elements can be moved as plain
+ * fixed-width words (F32/I32 as uint32_t, F16/BF16/I16 as uint16_t, I8 as uint8_t), same as
+ * ggml_compute_forward_concat_{f32,f16,i8}() in ggml-cpu. Handles non-contiguous src0/src1
+ * (e.g. a transposed src1, as used by the delta-net conv-state concat) since every element is
+ * addressed through its own strides. Threaded over the full ne1*ne2*ne3 row range via OpenMP so
+ * it scales even when one of those dims is small (e.g. a single sequence).
+ */
+template <typename T>
+static void ggml_zendnn_compute_forward_concat_elemwise(
+    ggml_backend_zendnn_context * ctx,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int32_t dim = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(dim >= 0 && dim < 4);
+
+    int64_t o[4] = {0, 0, 0, 0};
+    o[dim] = src0->ne[dim];
+
+    const int64_t nr = ne1*ne2*ne3;
+
+    #pragma omp parallel for num_threads(ctx->n_threads) schedule(static)
+    for (int64_t ir = 0; ir < nr; ir++) {
+        const int64_t i3 = ir/(ne2*ne1);
+        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
+        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+        for (int64_t i0 = 0; i0 < ne0; i0++) {
+            const T * x;
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+                x = (const T *) ((const char *)src0->data + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03);
+            } else {
+                x = (const T *) ((const char *)src1->data + (i0-o[0])*nb10 + (i1-o[1])*nb11 + (i2-o[2])*nb12 + (i3-o[3])*nb13);
+            }
+            T * y = (T *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+            *y = *x;
+        }
+    }
+
+    GGML_UNUSED(ctx);
+}
+
+/**
+ * ZenDNN CONCAT, row-memcpy path: used for block-quantized and other types that can't be moved
+ * element by element. Requires contiguous rows, same as ggml_compute_forward_concat_any().
+ */
+static void ggml_zendnn_compute_forward_concat_any(
+    ggml_backend_zendnn_context * ctx,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int32_t dim = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(dim >= 0 && dim < 4);
+    GGML_ASSERT(ggml_is_contiguous_rows(src0));
+    GGML_ASSERT(ggml_is_contiguous_rows(src1));
+
+    int64_t o[4] = {0, 0, 0, 0};
+
+    if (dim == 0) {
+        GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
+        GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+        o[dim] = src0->ne[dim]/ggml_blck_size(src0->type);
+    } else {
+        o[dim] = src0->ne[dim];
+    }
+
+    // Region 1: copy rows from src0
+    {
+        const int64_t nr = ne01*ne02*ne03;
+        #pragma omp parallel for num_threads(ctx->n_threads) schedule(static)
+        for (int64_t ir = 0; ir < nr; ir++) {
+            const int64_t i3 = ir/(ne02*ne01);
+            const int64_t i2 = (ir - i3*ne02*ne01)/ne01;
+            const int64_t i1 = (ir - i3*ne02*ne01 - i2*ne01);
+            const char * x = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+                  char * y = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
+            std::memcpy(y, x, ggml_row_size(src0->type, ne00));
+        }
+    }
+
+    // Region 2: copy rows from src1, offset into dst by o[]
+    {
+        const int64_t nr = ne11*ne12*ne13;
+        #pragma omp parallel for num_threads(ctx->n_threads) schedule(static)
+        for (int64_t ir = 0; ir < nr; ir++) {
+            const int64_t i3 = ir/(ne12*ne11);
+            const int64_t i2 = (ir - i3*ne12*ne11)/ne11;
+            const int64_t i1 = (ir - i3*ne12*ne11 - i2*ne11);
+            const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
+                  char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
+            std::memcpy(y, x, ggml_row_size(src1->type, ne10));
+        }
+    }
+
+    GGML_UNUSED(ctx);
+}
+
+static void ggml_zendnn_compute_forward_concat(
+    ggml_backend_zendnn_context * ctx,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_I16:
+            ggml_zendnn_compute_forward_concat_elemwise<uint16_t>(ctx, dst);
+            break;
+        case GGML_TYPE_I8:
+            ggml_zendnn_compute_forward_concat_elemwise<uint8_t>(ctx, dst);
+            break;
+        case GGML_TYPE_F32:
+        case GGML_TYPE_I32:
+            ggml_zendnn_compute_forward_concat_elemwise<uint32_t>(ctx, dst);
+            break;
+        default:
+            ggml_zendnn_compute_forward_concat_any(ctx, dst);
+    }
+}
+
 // backend interface
 
 static const char * ggml_backend_zendnn_get_name(ggml_backend_t backend) {
@@ -548,6 +680,9 @@ static ggml_status ggml_backend_zendnn_graph_compute(ggml_backend_t backend, ggm
                 break;
             case GGML_OP_MUL_MAT_ID:
                 ggml_zendnn_compute_forward_mul_mat_id(ctx, node);
+                break;
+            case GGML_OP_CONCAT:
+                ggml_zendnn_compute_forward_concat(ctx, node);
                 break;
             case GGML_OP_NONE:
             case GGML_OP_RESHAPE:
@@ -691,6 +826,23 @@ static bool ggml_zendnn_adaptive_fallback_enabled() {
     return enabled;
 }
 
+// CONCAT sits between ops ZenDNN does not implement, so claiming one always costs two
+// extra graph splits. Decline the small ones, which cannot repay that out of threading.
+// 0 (the default) claims every concat; a very large value keeps them all on the CPU.
+static size_t ggml_zendnn_concat_min_bytes() {
+    static const char * env   = std::getenv("GGML_ZENDNN_CONCAT_MIN_BYTES");
+    static const size_t bytes = env ? (size_t) std::atoll(env) : 0;
+    return bytes;
+}
+
+// Benchmark toggle for the two MUL_MAT_ID gates below. 1 (the default) keeps
+// base behavior; 0 lets every MoE shape reach ZenDNN.
+static bool ggml_zendnn_moe_clamp_enabled() {
+    static const char * env     = std::getenv("GGML_ZENDNN_MOE_CLAMP");
+    static const bool   enabled = env == nullptr || std::atoi(env) != 0;
+    return enabled;
+}
+
 static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_NONE:
@@ -699,6 +851,9 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
+
+        case GGML_OP_CONCAT:
+            return ggml_nbytes(op) >= ggml_zendnn_concat_min_bytes();
 
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
@@ -724,7 +879,7 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
                 }
 
                 // MUL_MAT_ID's gather+matmul+scatter approach favors a moderate expert count
-                if (op->op == GGML_OP_MUL_MAT_ID) {
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_zendnn_moe_clamp_enabled()) {
                     const int64_t n_experts = weights->ne[2];
                     const int64_t max_experts = 32;
                     if (n_experts > max_experts) {
